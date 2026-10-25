@@ -3,7 +3,6 @@ name: build
 on:
   push:
     branches: [ main ]
-  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -26,9 +25,7 @@ jobs:
 
       - name: Build
         shell: bash
-        run: |
-          set -o pipefail
-          gradle build --console=plain --stacktrace 2>&1 | tee build.log
+        run: gradle build --console=plain --stacktrace 2>&1 | tee build.log
 
       - name: Upload build log
         if: always()
@@ -40,4 +37,8 @@ jobs:
 
       - name: Upload mod jar
         if: success()
-        uses:
+        uses: actions/upload-artifact@v4
+        with:
+          name: delta-visuals-jar
+          path: build/libs/*.jar
+          if-no-files-found: error
