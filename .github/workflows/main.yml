@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: delta-visuals-repo
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,7 +46,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log
-          path: build.log
+          path: delta-visuals-repo/build.log
           if-no-files-found: ignore
 
       - name: Upload mod jar
@@ -51,5 +54,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: delta-visuals-jar
-          path: build/libs/*.jar
+          path: delta-visuals-repo/build/libs/*.jar
           if-no-files-found: error
