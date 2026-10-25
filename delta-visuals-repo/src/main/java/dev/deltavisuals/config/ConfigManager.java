@@ -1,0 +1,188 @@
+package dev.deltavisuals.config;
+
+import com.google.gson.*;
+import dev.deltavisuals.core.Module;
+import dev.deltavisuals.core.Modules;
+import net.fabricmc.loader.api.FabricLoader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Stream;
+
+/** JSON profiles in .minecraft/config/delta_visuals/profiles. Debounced autosave, validated load, corrupt-file recovery. */
+public final class ConfigManager {
+    private static final Logger LOG = LoggerFactory.getLogger("DeltaVisuals/Config");
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final int VERSION = 1;
+
+    private static volatile boolean dirty;
+    private static volatile boolean loading;
+    private static long dirtyAt;
+    private static String profile = "default";
+
+    private ConfigManager() {}
+
+    private static Path root() { return FabricLoader.getInstance().getConfigDir().resolve("delta_visuals"); }
+    private static Path profilesDir() { return root().resolve("profiles"); }
+    private static Path file(String name) { return profilesDir().resolve(name + ".json"); }
+    private static Path activeFile() { return root().resolve("active.txt"); }
+
+    public static String profile() { return profile; }
+
+    public static void init() {
+        try {
+            Files.createDirectories(profilesDir());
+            if (Files.exists(activeFile())) {
+                String p = sanitize(Files.readString(activeFile(), StandardCharsets.UTF_8).trim());
+                if (!p.isEmpty()) profile = p;
+            }
+        } catch (IOException e) {
+            LOG.error("Cannot prepare config directory", e);
+        }
+        load(profile);
+    }
+
+    public static void markDirty() {
+        if (loading) return;
+        dirty = true;
+        dirtyAt = System.currentTimeMillis();
+    }
+
+    /** Called every client tick: writes the config ~1 s after the last change. */
+    public static void tick() {
+        if (dirty && System.currentTimeMillis() - dirtyAt > 1000) save();
+    }
+
+    public static synchronized void save() {
+        dirty = false;
+        try {
+            JsonObject root = new JsonObject();
+            root.addProperty("version", VERSION);
+            JsonObject mods = new JsonObject();
+            for (Module m : Modules.all()) mods.add(m.id, m.toJson());
+            root.add("modules", mods);
+
+            Files.createDirectories(profilesDir());
+            Path target = file(profile);
+            Path tmp = target.resolveSibling(profile + ".json.tmp");
+            Files.writeString(tmp, GSON.toJson(root), StandardCharsets.UTF_8);
+            try {
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+            Files.writeString(activeFile(), profile, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            LOG.error("Failed to save config", e);
+        }
+    }
+
+    /** @return true if the profile was loaded as stored, false if defaults had to be restored. */
+    public static synchronized boolean load(String name) {
+        Path f = file(name);
+        loading = true;
+        try {
+            resetAllQuiet();
+            if (!Files.exists(f)) { loading = false; save(); return true; }
+            JsonElement root = JsonParser.parseString(Files.readString(f, StandardCharsets.UTF_8));
+            if (!root.isJsonObject()) throw new JsonParseException("root is not an object");
+            JsonObject o = root.getAsJsonObject();
+            if (o.has("version") && o.get("version").getAsInt() > VERSION)
+                LOG.warn("Profile {} was written by a newer version; unknown fields are ignored", name);
+            JsonObject mods = o.has("modules") && o.get("modules").isJsonObject() ? o.getAsJsonObject("modules") : new JsonObject();
+            for (Module m : Modules.all()) {
+                JsonElement e = mods.get(m.id);
+                if (e != null && e.isJsonObject()) m.fromJson(e.getAsJsonObject());
+            }
+            return true;
+        } catch (Exception ex) {
+            LOG.error("Profile '{}' is corrupt, restoring defaults", name, ex);
+            try {
+                Files.move(f, f.resolveSibling(name + ".corrupt-" + System.currentTimeMillis() + ".json"));
+            } catch (Exception ignored) { }
+            resetAllQuiet();
+            loading = false;
+            save();
+            return false;
+        } finally {
+            loading = false;
+            dirty = false;
+        }
+    }
+
+    private static void resetAllQuiet() {
+        for (Module m : Modules.all()) m.resetToDefaults();
+    }
+
+    /** User-triggered reset of every setting of the active profile. */
+    public static void resetAll() {
+        resetAllQuiet();
+        save();
+    }
+
+    public static List<String> profiles() {
+        List<String> out = new ArrayList<>();
+        try (Stream<Path> s = Files.list(profilesDir())) {
+            s.map(p -> p.getFileName().toString())
+                .filter(n -> n.endsWith(".json") && !n.contains(".corrupt-"))
+                .forEach(n -> out.add(n.substring(0, n.length() - 5)));
+        } catch (IOException ignored) { }
+        if (!out.contains("default")) out.add("default");
+        Collections.sort(out);
+        return out;
+    }
+
+    public static String switchProfile(String name) {
+        name = sanitize(name);
+        if (name.isEmpty() || name.equals(profile)) return profile;
+        save();
+        profile = name;
+        boolean ok = load(name);
+        try { Files.writeString(activeFile(), profile, StandardCharsets.UTF_8); } catch (IOException ignored) { }
+        return ok ? "Profile: " + name : "Profile '" + name + "' was damaged - defaults restored";
+    }
+
+    public static String nextProfile() {
+        List<String> l = profiles();
+        int i = l.indexOf(profile);
+        return switchProfile(l.get((i + 1) % l.size()));
+    }
+
+    /** Creates profile-N; copies the current settings when fromCurrent, otherwise starts from defaults. */
+    public static String createProfile(boolean fromCurrent) {
+        save();
+        List<String> l = profiles();
+        int n = 1;
+        while (l.contains("profile-" + n)) n++;
+        String name = "profile-" + n;
+        if (!fromCurrent) {
+            profile = name;
+            resetAllQuiet();
+            save();
+            return "Created empty profile: " + name;
+        }
+        profile = name;
+        save();
+        return "Duplicated into: " + name;
+    }
+
+    public static String deleteProfile() {
+        if (profile.equals("default")) return "The default profile cannot be deleted";
+        String old = profile;
+        try { Files.deleteIfExists(file(old)); } catch (IOException e) { return "Could not delete " + old; }
+        profile = "default";
+        load("default");
+        try { Files.writeString(activeFile(), profile, StandardCharsets.UTF_8); } catch (IOException ignored) { }
+        return "Deleted " + old;
+    }
+
+    private static String sanitize(String s) {
+        return s == null ? "" : s.replaceAll("[^A-Za-z0-9_\\-]", "");
+    }
+}
