@@ -27,6 +27,17 @@ jobs:
         shell: bash
         run: gradle build --console=plain --stacktrace 2>&1 | tee build.log
 
+      - name: Show errors
+        if: failure()
+        shell: bash
+        run: |
+          ERR=$(grep -E "error:|What went wrong|Could not|Unsupported|not found|FAILED" -A4 build.log | head -n 60)
+          if [ -z "$ERR" ]; then ERR=$(tail -n 40 build.log); fi
+          ERR=${ERR//'%'/'%25'}
+          ERR=${ERR//$'\r'/}
+          ERR=${ERR//$'\n'/'%0A'}
+          echo "::error title=Build log::$ERR"
+
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
